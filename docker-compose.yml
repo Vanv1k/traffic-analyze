@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  drone_db:
+    image: postgres:latest
+    container_name: drone_db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: drone_data
+    ports:
+      - "5432:5432"
+    volumes:
+      - drone_db_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    restart: unless-stopped
+
+volumes:
+  drone_db_data:
