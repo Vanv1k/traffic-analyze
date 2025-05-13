@@ -1,5 +1,3 @@
-import argparse
-from typing import Optional, Dict
 import cv2
 import numpy as np
 from tqdm import tqdm
@@ -7,10 +5,7 @@ from ultralytics import YOLO
 import supervision as sv
 import psycopg2
 from datetime import datetime, timedelta
-from dotenv import load_dotenv
-import os
-
-load_dotenv()
+from typing import Optional, Dict
 
 COLORS = sv.ColorPalette.from_hex(["#E6194B", "#3CB44B", "#FFE119", "#3C76D1"])
 
@@ -23,17 +18,18 @@ class VideoProcessor:
         confidence_threshold: float = 0.5,
         iou_threshold: float = 0.7,
         drone_id: int = 1,
-        min_track_length: int = 5
+        min_track_length: int = 5,
+        db_config: Dict[str, str] = None
     ) -> None:
         self.conf_threshold = confidence_threshold
         self.iou_threshold = iou_threshold
         self.source_video_path = source_video_path
-        self.target_video_path = target_video_path
+        self.target_video_path = target_video_path 
         self.drone_id = drone_id
         self.min_track_length = min_track_length
 
         self.model = YOLO(source_weights_path)
-        self.tracker = sv.ByteTrack()  # Убраны параметры track_thresh, match_thresh, frame_rate
+        self.tracker = sv.ByteTrack()
         self.video_info = sv.VideoInfo.from_video_path(source_video_path)
         self.class_names = self.model.names
         print("Class ID to Name mapping:", self.class_names)
@@ -44,13 +40,7 @@ class VideoProcessor:
             color=COLORS, position=sv.Position.CENTER, trace_length=100, thickness=2
         )
 
-        self.db_config = {
-            "dbname": os.getenv("DB_NAME"),
-            "user": os.getenv("DB_USER"),
-            "password": os.getenv("DB_PASSWORD"),
-            "host": os.getenv("DB_HOST"),
-            "port": os.getenv("DB_PORT")
-        }
+        self.db_config = db_config
         self.conn = psycopg2.connect(**self.db_config)
         self.cursor = self.conn.cursor()
 
@@ -62,7 +52,7 @@ class VideoProcessor:
             INSERT INTO missions (drone_id, video_path, start_time, fps)
             VALUES (%s, %s, %s, %s) RETURNING mission_id;
         """
-        self.cursor.execute(query, (self.drone_id, self.source_video_path, datetime.now(), self.video_info.fps))
+        self.cursor.execute(query, (self.drone_id, self.target_video_path, datetime.now(), self.video_info.fps))
         self.conn.commit()
         return self.cursor.fetchone()[0]
 
@@ -89,8 +79,9 @@ class VideoProcessor:
                 }
             else:
                 last_x, last_y = self.tracks[tracker_id]["last_center"]
-                speed = np.sqrt((center_x - last_x) ** 2 + (center_y - last_y) ** 2)
-                self.tracks[tracker_id]["speed"] = speed
+                speed_per_frame = np.sqrt((center_x - last_x) ** 2 + (center_y - last_y) ** 2)
+                speed_per_second = speed_per_frame * fps
+                self.tracks[tracker_id]["speed"] = speed_per_second
                 self.tracks[tracker_id]["last_center"] = (center_x, center_y)
                 self.tracks[tracker_id]["frame_count"] += 1
 
@@ -132,7 +123,7 @@ class VideoProcessor:
 
         active_speeds = [self.tracks[int(tid)]["speed"] for tid in detections.tracker_id if tid in self.tracks]
         avg_speed = np.mean(active_speeds) if active_speeds else 0.0
-        traffic_jam = "Jam" if vehicle_count > 10 and avg_speed < 5 else "No Jam"
+        traffic_jam = "Jam" if vehicle_count > 10 and avg_speed < 150 else "No Jam"
         jam_color = sv.Color.RED if traffic_jam == "Jam" else sv.Color.GREEN
 
         annotated_frame = sv.draw_text(
@@ -151,7 +142,7 @@ class VideoProcessor:
         )
         annotated_frame = sv.draw_text(
             scene=annotated_frame,
-            text=f"Traffic: {traffic_jam} (Speed: {avg_speed:.1f})",
+            text=f"Traffic: {traffic_jam} (Speed: {avg_speed:.1f} px/s)",
             text_anchor=sv.Point(x=50, y=110),
             background_color=jam_color,
             text_color=sv.Color.WHITE
@@ -179,6 +170,7 @@ class VideoProcessor:
 
         self._save_tracks_to_db()
         self.conn.close()
+        return self.mission_id
 
     def process_frame(self, frame: np.ndarray, frame_number: int) -> np.ndarray:
         results = self.model(frame, verbose=False, conf=self.conf_threshold, iou=self.iou_threshold)[0]
@@ -186,23 +178,3 @@ class VideoProcessor:
         detections = self.tracker.update_with_detections(detections)
         self._update_tracks(detections, frame_number)
         return self.annotate_frame(frame, detections)
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Drone Object Detection and Tracking")
-    parser.add_argument("--source_weights_path", required=True, help="Path to the source weights file", type=str)
-    parser.add_argument("--source_video_path", required=True, help="Path to the source video file", type=str)
-    parser.add_argument("--target_video_path", default=None, help="Path to the target video file (output)", type=str)
-    parser.add_argument("--confidence_threshold", default=0.5, help="Confidence threshold for the model", type=float)
-    parser.add_argument("--iou_threshold", default=0.7, help="IOU threshold for the model", type=float)
-
-    args = parser.parse_args()
-    processor = VideoProcessor(
-        source_weights_path=args.source_weights_path,
-        source_video_path=args.source_video_path,
-        target_video_path=args.target_video_path,
-        confidence_threshold=args.confidence_threshold,
-        iou_threshold=args.iou_threshold,
-        drone_id=1
-    )
-    processor.process_video()

@@ -1,5 +1,6 @@
 DB_NAME=data
 DB_USER=user
 DB_PASSWORD=user
-DB_HOST=localhost
+DB_HOST=drone_db
 DB_PORT=5432
+REDIS_URL=redis://drone_redis:6379/0
