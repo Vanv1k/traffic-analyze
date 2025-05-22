@@ -91,7 +91,7 @@ class VideoProcessor:
                 mission_id, tracker_id, class_name, first_frame_number,
                 bbox_x, bbox_y, bbox_width, bbox_height, first_seen_timestamp
             ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (tracker_id) DO NOTHING;
+           ON CONFLICT (mission_id, tracker_id) DO NOTHING;
         """
         for tracker_id, track in self.tracks.items():
             if track["frame_count"] >= self.min_track_length:
@@ -128,21 +128,21 @@ class VideoProcessor:
 
         annotated_frame = sv.draw_text(
             scene=annotated_frame,
-            text=f"Vehicles: {vehicle_count}",
+            text=f"  Vehicles: {vehicle_count}",
             text_anchor=sv.Point(x=50, y=50),
             background_color=sv.Color.BLACK,
             text_color=sv.Color.WHITE
         )
         annotated_frame = sv.draw_text(
             scene=annotated_frame,
-            text=f"Congestion: {congestion}",
+            text=f"  Congestion: {congestion}",
             text_anchor=sv.Point(x=50, y=80),
             background_color=bg_color,
             text_color=sv.Color.WHITE
         )
         annotated_frame = sv.draw_text(
             scene=annotated_frame,
-            text=f"Traffic: {traffic_jam} (Speed: {avg_speed:.1f} px/s)",
+            text=f"  Traffic: {traffic_jam} (Speed: {avg_speed:.1f} px/s)",
             text_anchor=sv.Point(x=50, y=110),
             background_color=jam_color,
             text_color=sv.Color.WHITE
