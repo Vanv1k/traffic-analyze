@@ -197,7 +197,6 @@ async def get_processed_video(mission_id: int = Path(..., description="ID мис
         
         result_path = f"recoded_videos/{os.path.basename(video_path)}"
 
-        # перекодировка для браузера
         subprocess.run([
             "ffmpeg", "-y",  # -y чтобы перезаписать, если уже существует
             "-i", video_path,
@@ -217,110 +216,123 @@ async def get_processed_video(mission_id: int = Path(..., description="ID мис
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 
-@app.get("/db", 
-    summary="Получить данные из таблицы",
-    responses={
-        200: {"description": "Данные из таблицы"},
-        400: {"model": HTTPErrorResponse, "description": "Неверное имя таблицы"},
-        500: {"model": HTTPErrorResponse, "description": "Ошибка сервера"}
-    })
-async def get_db_data(
-    table: str = Query(..., description="Имя таблицы", example="missions"),
-    limit: int = Query(100, description="Лимит записей", ge=1, le=1000)
+@app.get("/filters/", summary="Получить доступные фильтры")
+async def get_filters(
+    type: str = Query(..., description="Тип фильтра", enum=["class_names", "mission_ids", "drone_ids"])
 ):
-    """Возвращает данные из указанной таблицы с ограничением количества записей"""
-    valid_tables = ["drones", "missions", "tracked_objects"]
-    if table not in valid_tables:
-        raise HTTPException(status_code=400, detail="Invalid table name")
+    """Возвращает доступные значения для фильтрации"""
+    conn = psycopg2.connect(**db_config)
+    cursor = conn.cursor()
     
-    conn = psycopg2.connect(**db_config)
-    cursor = conn.cursor()
-    cursor.execute(f"SELECT * FROM {table} LIMIT %s", (limit,))
-    columns = [desc[0] for desc in cursor.description]
-    data = [dict(zip(columns, row)) for row in cursor.fetchall()]
-    cursor.close()
-    conn.close()
-    return data
+    try:
+        if type == "class_names":
+            cursor.execute("SELECT DISTINCT class_name FROM tracked_objects")
+            result = [row[0] for row in cursor.fetchall()]
+        elif type == "mission_ids":
+            cursor.execute("SELECT mission_id FROM missions ORDER BY mission_id")
+            result = [row[0] for row in cursor.fetchall()]
+        elif type == "drone_ids":
+            cursor.execute("SELECT drone_id, drone_name FROM drones ORDER BY drone_id")
+            result = [{"drone_id": row[0], "drone_name": row[1]} for row in cursor.fetchall()]
+        else:
+            return {"error": "Invalid filter type"}
+            
+        return result
+    finally:
+        cursor.close()
+        conn.close()
 
-@app.get("/filters/class_names",
-    response_model=List[str],
-    summary="Получить уникальные классы объектов",
-    description="Возвращает список всех уникальных классов обнаруженных объектов",
-    tags=["Filters"],
-    responses={
-        200: {
-            "description": "Список классов объектов",
-            "content": {
-                "application/json": {
-                    "example": ["car", "truck", "person", "bicycle"]
-                }
-            }
-        },
-        500: {"model": HTTPErrorResponse, "description": "Ошибка сервера"}
-    })
-def get_class_names():
-    """Возвращает список уникальных классов объектов из таблицы tracked_objects"""
+@app.get("/data/", summary="Получить данные из таблицы")
+async def get_table_data(
+    table: str = Query(..., description="Имя таблицы", enum=["drones", "missions", "tracked_objects"]),
+    join: Optional[str] = Query(None, description="Таблица для join (только для missions)"),
+    class_name: Optional[str] = Query(None, description="Фильтр по классу объекта"),
+    mission_id: Optional[int] = Query(None, description="Фильтр по ID миссии"),
+    drone_id: Optional[int] = Query(None, description="Фильтр по ID дрона"),
+    min_speed: Optional[int] = Query(None, description="Минимальная скорость (км/ч)"),
+    min_time: Optional[str] = Query(None, description="Минимальное время обнаружения (YYYY-MM-DDTHH:MM)"),
+    limit: int = Query(10, description="Лимит записей", ge=1, le=1000),
+    page: int = Query(1, description="Номер страницы", ge=1)
+):
+    """Возвращает данные из указанной таблицы с возможностью фильтрации"""
+    offset = (page - 1) * limit
     conn = psycopg2.connect(**db_config)
     cursor = conn.cursor()
-    cursor.execute("SELECT DISTINCT class_name FROM tracked_objects")
-    results = [row[0] for row in cursor.fetchall()]
-    cursor.close()
-    conn.close()
-    return results
-
-@app.get("/filters/mission_ids",
-    response_model=List[int],
-    summary="Получить ID всех миссий",
-    description="Возвращает список всех ID миссий, отсортированных по возрастанию",
-    tags=["Filters"],
-    responses={
-        200: {
-            "description": "Список ID миссий",
-            "content": {
-                "application/json": {
-                    "example": [1, 2, 3, 4, 5]
-                }
+    
+    try:
+        base_query = f"SELECT * FROM {table}"
+        count_query = f"SELECT COUNT(*) FROM {table}"
+        params = []
+        order_by = "id"
+        if table == "drones":
+            order_by = "drone_id"
+        
+        if table == "missions" and join == "drones":
+            base_query = """
+                SELECT m.*, d.drone_name 
+                FROM missions m
+                LEFT JOIN drones d ON m.drone_id = d.drone_id
+            """
+            count_query = """
+                SELECT COUNT(*) 
+                FROM missions m
+            """
+            order_by = "m.mission_id"
+        
+        # Условия фильтрации для разных таблиц
+        where_clauses = []
+        
+        if table == "tracked_objects":
+            if class_name:
+                where_clauses.append("class_name = %s")
+                params.append(class_name)
+            if mission_id:
+                where_clauses.append("mission_id = %s")
+                params.append(mission_id)
+            if min_speed is not None:
+                where_clauses.append("avg_speed_kmh >= %s")
+                params.append(min_speed)
+            if min_time:
+                where_clauses.append("first_seen_timestamp >= %s")
+                params.append(min_time)
+                
+        elif table == "missions":
+            if drone_id:
+                where_clauses.append("m.drone_id = %s" if join == "drones" else "drone_id = %s")
+                params.append(drone_id)
+        
+        if where_clauses:
+            where_stmt = " WHERE " + " AND ".join(where_clauses)
+            base_query += where_stmt
+            count_query += where_stmt
+        
+        base_query += f" ORDER BY {order_by}"
+        
+        base_query += f" LIMIT %s OFFSET %s"
+        params.extend([limit, offset])
+        
+        cursor.execute(base_query, params)
+        columns = [desc[0] for desc in cursor.description]
+        data = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        
+        cursor.execute(count_query, params[:-2]) 
+        total = cursor.fetchone()[0]
+        
+        return {
+            "data": data,
+            "pagination": {
+                "total": total,
+                "page": page,
+                "limit": limit,
+                "total_pages": (total + limit - 1) // limit
             }
-        },
-        500: {"model": HTTPErrorResponse, "description": "Ошибка сервера"}
-    })
-def get_mission_ids():
-    """Возвращает список всех ID миссий из таблицы missions"""
-    conn = psycopg2.connect(**db_config)
-    cursor = conn.cursor()
-    cursor.execute("SELECT mission_id FROM missions ORDER BY mission_id")
-    results = [row[0] for row in cursor.fetchall()]
-    cursor.close()
-    conn.close()
-    return results
-
-@app.get("/filters/drone_ids",
-    response_model=List[Dict[str, Union[int, str]]],
-    summary="Получить список дронов",
-    description="Возвращает список всех дронов с их ID и названиями",
-    tags=["Filters"],
-    responses={
-        200: {
-            "description": "Список дронов",
-            "content": {
-                "application/json": {
-                    "example": [
-                        {"drone_id": 1, "drone_name": "DJI Mavic 3"},
-                        {"drone_id": 2, "drone_name": "Autel EVO II"}
-                    ]
-                }
-            }
-        },
-        500: {"model": HTTPErrorResponse, "description": "Ошибка сервера"}
-    })
-def get_drone_ids():
-    conn = psycopg2.connect(**db_config)
-    cursor = conn.cursor()
-    cursor.execute("SELECT drone_id, drone_name FROM drones ORDER BY drone_id")
-    results = [{"drone_id": row[0], "drone_name": row[1]} for row in cursor.fetchall()]
-    cursor.close()
-    conn.close()
-    return results
+        }
+    except Exception as e:
+        print(f"Database error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    finally:
+        cursor.close()
+        conn.close()
 
 @app.get("/download/{filename}",
     summary="Скачать результат обработки",
@@ -350,3 +362,21 @@ async def download_result(
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(file_path, filename=filename)
+
+@app.get("/detection_counts/", summary="Получить количество детекций по миссиям")
+async def get_detection_counts():
+    """Возвращает количество обнаруженных объектов для каждой миссии"""
+    conn = psycopg2.connect(**db_config)
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            SELECT mission_id, COUNT(*) as count 
+            FROM tracked_objects 
+            GROUP BY mission_id
+        """)
+        result = {row[0]: row[1] for row in cursor.fetchall()}
+        return result
+    finally:
+        cursor.close()
+        conn.close()
